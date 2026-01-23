@@ -1,10 +1,9 @@
-from database import engine
 from fastapi import FastAPI, Depends, HTTPException, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from database import SessionLocal
-from models import Employee, WeeklyScore, User, Organization, OrganizationMembership
+from database import SessionLocal, engine
+from models import Employee, WeeklyScore, User, Organization, OrganizationMembership, Base
 from scoring import calculate_productivity
 from datetime import datetime, timedelta
 import openpyxl
