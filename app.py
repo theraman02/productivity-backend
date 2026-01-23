@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from models import Employee, WeeklyScore, User
+from models import Employee, WeeklyScore, User, Organization, OrganizationMembership
 from scoring import calculate_productivity
 from datetime import datetime, timedelta
 import openpyxl
@@ -26,7 +26,7 @@ app = FastAPI(title="Employee Productivity Tracker")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://productivity-tracker-three.vercel.app",  # Replace with YOUR Vercel URL
+        "https://productivity-tracker-three.vercel.app",
         "http://localhost:3000"
     ],
     allow_credentials=True,
@@ -101,6 +101,7 @@ def register(
         raise HTTPException(
             status_code=400, detail="Username or email already exists")
 
+    # Create user
     organization_id = str(uuid.uuid4())
     hashed_pw = hash_password(password)
 
@@ -108,14 +109,31 @@ def register(
         username=username,
         email=email,
         password_hash=hashed_pw,
-        role="admin",
-        organization_id=organization_id
+        primary_organization_id=organization_id
     )
     db.add(user)
+    db.flush()
+
+    # Create organization
+    org = Organization(
+        id=organization_id,
+        name=f"{username}'s Organization",
+        owner_id=user.id
+    )
+    db.add(org)
+
+    # Create membership
+    membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=organization_id,
+        role="admin"
+    )
+    db.add(membership)
+
     db.commit()
     db.refresh(user)
 
-    token = create_session(user.id, user.organization_id, user.role)
+    token = create_session(user.id, organization_id, "admin")
 
     return {
         "message": "User registered successfully",
@@ -124,8 +142,8 @@ def register(
             "id": user.id,
             "username": user.username,
             "email": user.email,
-            "role": user.role,
-            "organization_id": user.organization_id
+            "role": "admin",
+            "organization_id": organization_id
         }
     }
 
@@ -141,7 +159,14 @@ def login(
     if not user or user.password_hash != hash_password(password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_session(user.id, user.organization_id, user.role)
+    # Get user's primary organization and role
+    membership = db.query(OrganizationMembership).filter(
+        OrganizationMembership.user_id == user.id,
+        OrganizationMembership.organization_id == user.primary_organization_id
+    ).first()
+
+    role = membership.role if membership else "admin"
+    token = create_session(user.id, user.primary_organization_id, role)
 
     return {
         "message": "Login successful",
@@ -150,8 +175,8 @@ def login(
             "id": user.id,
             "username": user.username,
             "email": user.email,
-            "role": user.role,
-            "organization_id": user.organization_id
+            "role": role,
+            "organization_id": user.primary_organization_id
         }
     }
 
@@ -169,13 +194,103 @@ def get_current_user_info(current_user: dict = Depends(get_current_user), db: Se
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Get all organizations user belongs to
+    memberships = db.query(OrganizationMembership, Organization).join(
+        Organization, OrganizationMembership.organization_id == Organization.id
+    ).filter(OrganizationMembership.user_id == user.id).all()
+
+    organizations = [
+        {
+            "id": org.id,
+            "name": org.name,
+            "role": membership.role,
+            "is_primary": org.id == user.primary_organization_id
+        }
+        for membership, org in memberships
+    ]
+
     return {
         "id": user.id,
         "username": user.username,
         "email": user.email,
-        "role": user.role,
-        "organization_id": user.organization_id
+        "role": current_user['role'],
+        "organization_id": current_user['organization_id'],
+        "organizations": organizations
     }
+
+
+@app.delete("/auth/account")
+def delete_account(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == current_user['user_id']).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Delete user's primary organization (if they're the owner)
+    org = db.query(Organization).filter(
+        Organization.id == user.primary_organization_id,
+        Organization.owner_id == user.id
+    ).first()
+
+    if org:
+        # Delete all employees in this organization
+        db.query(Employee).filter(Employee.organization_id == org.id).delete()
+        # Delete all scores in this organization
+        db.query(WeeklyScore).filter(
+            WeeklyScore.organization_id == org.id).delete()
+        # Delete organization
+        db.delete(org)
+
+    # Delete all memberships
+    db.query(OrganizationMembership).filter(
+        OrganizationMembership.user_id == user.id).delete()
+
+    # Delete user
+    db.delete(user)
+    db.commit()
+
+    # Delete session
+    token = None
+    for t, s in sessions.items():
+        if s['user_id'] == user.id:
+            token = t
+            break
+    if token:
+        del sessions[token]
+
+    return {"message": "Account deleted successfully"}
+
+
+# ============= ORGANIZATION SWITCHING =============
+
+@app.post("/organizations/switch")
+def switch_organization(
+    organization_id: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Check if user is member of this organization
+    membership = db.query(OrganizationMembership).filter(
+        OrganizationMembership.user_id == current_user['user_id'],
+        OrganizationMembership.organization_id == organization_id
+    ).first()
+
+    if not membership:
+        raise HTTPException(
+            status_code=403, detail="You are not a member of this organization")
+
+    # Update session
+    for token, session in sessions.items():
+        if session['user_id'] == current_user['user_id']:
+            session['organization_id'] = organization_id
+            session['role'] = membership.role
+
+            return {
+                "message": "Organization switched successfully",
+                "organization_id": organization_id,
+                "role": membership.role
+            }
+
+    raise HTTPException(status_code=500, detail="Session not found")
 
 
 # ============= EMPLOYEE ENDPOINTS =============
@@ -361,8 +476,8 @@ def delete_score(
     db.commit()
     return {"message": "Score deleted successfully"}
 
-
 # ============= TEAM MANAGEMENT ENDPOINTS =============
+
 
 @app.get("/team/members")
 def get_team_members(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -370,20 +485,77 @@ def get_team_members(current_user: dict = Depends(get_current_user), db: Session
         raise HTTPException(
             status_code=403, detail="Only admins can view team members")
 
-    members = db.query(User).filter(
-        User.organization_id == current_user['organization_id']
-    ).all()
+    # Get all memberships for current organization
+    memberships = db.query(OrganizationMembership, User).join(
+        User, OrganizationMembership.user_id == User.id
+    ).filter(OrganizationMembership.organization_id == current_user['organization_id']).all()
 
     return [
         {
-            "id": member.id,
-            "username": member.username,
-            "email": member.email,
-            "role": member.role,
-            "created_at": member.created_at
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": membership.role,
+            "created_at": user.created_at
         }
-        for member in members
+        for membership, user in memberships
     ]
+
+
+@app.post("/team/invite")
+def invite_user_to_team(
+    username_or_email: str = Form(...),
+    role: str = Form("viewer"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user['role'] != 'admin':
+        raise HTTPException(
+            status_code=403, detail="Only admins can invite users")
+
+    # Find user by username or email
+    user = db.query(User).filter(
+        (User.username == username_or_email) | (
+            User.email == username_or_email)
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404, detail="User not found. They need to register first.")
+
+    # Check if already a member
+    existing = db.query(OrganizationMembership).filter(
+        OrganizationMembership.user_id == user.id,
+        OrganizationMembership.organization_id == current_user['organization_id']
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400, detail="User is already a member of this organization")
+
+    # Validate role
+    if role not in ['admin', 'viewer']:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    # Create membership
+    membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=current_user['organization_id'],
+        role=role
+    )
+
+    db.add(membership)
+    db.commit()
+
+    return {
+        "message": f"User {user.username} invited successfully",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": role
+        }
+    }
 
 
 @app.post("/team/members")
@@ -399,40 +571,76 @@ def create_team_member(
         raise HTTPException(
             status_code=403, detail="Only admins can add team members")
 
+    # Check if username/email exists
     existing = db.query(User).filter(
         (User.username == username) | (User.email == email)
     ).first()
 
     if existing:
-        raise HTTPException(
-            status_code=400, detail="Username or email already exists")
+        # User exists, invite them instead
+        existing_membership = db.query(OrganizationMembership).filter(
+            OrganizationMembership.user_id == existing.id,
+            OrganizationMembership.organization_id == current_user['organization_id']
+        ).first()
 
+        if existing_membership:
+            raise HTTPException(
+                status_code=400, detail="User is already a member of this organization")
+
+        # Add them to the organization
+        membership = OrganizationMembership(
+            user_id=existing.id,
+            organization_id=current_user['organization_id'],
+            role=role
+        )
+        db.add(membership)
+        db.commit()
+
+        return {
+            "id": existing.id,
+            "username": existing.username,
+            "email": existing.email,
+            "role": role,
+            "message": "Existing user added to organization"
+        }
+
+    # Validate role
     if role not in ['admin', 'viewer']:
         raise HTTPException(status_code=400, detail="Invalid role")
 
+    # Create new user without their own organization
     hashed_pw = hash_password(password)
-    new_member = User(
+    new_user = User(
         username=username,
         email=email,
         password_hash=hashed_pw,
-        role=role,
-        organization_id=current_user['organization_id']
+        primary_organization_id=current_user['organization_id']
     )
 
-    db.add(new_member)
+    db.add(new_user)
+    db.flush()
+
+    # Add to current organization
+    membership = OrganizationMembership(
+        user_id=new_user.id,
+        organization_id=current_user['organization_id'],
+        role=role
+    )
+    db.add(membership)
+
     db.commit()
-    db.refresh(new_member)
+    db.refresh(new_user)
 
     return {
-        "id": new_member.id,
-        "username": new_member.username,
-        "email": new_member.email,
-        "role": new_member.role
+        "id": new_user.id,
+        "username": new_user.username,
+        "email": new_user.email,
+        "role": role
     }
 
 
 @app.delete("/team/members/{user_id}")
-def delete_team_member(
+def remove_team_member(
     user_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -442,18 +650,19 @@ def delete_team_member(
             status_code=403, detail="Only admins can remove team members")
 
     if user_id == current_user['user_id']:
-        raise HTTPException(
-            status_code=400, detail="Cannot delete your own account")
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
 
-    member = db.query(User).filter(
-        User.id == user_id,
-        User.organization_id == current_user['organization_id']
+    # Remove membership
+    membership = db.query(OrganizationMembership).filter(
+        OrganizationMembership.user_id == user_id,
+        OrganizationMembership.organization_id == current_user['organization_id']
     ).first()
 
-    if not member:
-        raise HTTPException(status_code=404, detail="Team member not found")
+    if not membership:
+        raise HTTPException(
+            status_code=404, detail="User is not a member of this organization")
 
-    db.delete(member)
+    db.delete(membership)
     db.commit()
 
     return {"message": "Team member removed successfully"}

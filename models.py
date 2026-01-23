@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
+from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
 
@@ -10,10 +11,28 @@ class User(Base):
     username = Column(String, unique=True, nullable=False, index=True)
     email = Column(String, unique=True, nullable=False, index=True)
     password_hash = Column(String, nullable=False)
-    role = Column(String, default="admin")  # "admin" or "viewer"
-    # Unique per user/company
-    organization_id = Column(String, nullable=False, index=True)
+    primary_organization_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    owner_id = Column(Integer, ForeignKey('users.id'))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OrganizationMembership(Base):
+    __tablename__ = "organization_memberships"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    organization_id = Column(String, ForeignKey(
+        'organizations.id'), index=True)
+    role = Column(String, default='viewer')
+    joined_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Employee(Base):
@@ -23,8 +42,8 @@ class Employee(Base):
     name = Column(String, nullable=False)
     department = Column(String, nullable=False)
     role = Column(String, nullable=False)
-    organization_id = Column(String, nullable=False,
-                             index=True)  # Links to User's org
+    organization_id = Column(String, ForeignKey(
+        'organizations.id'), nullable=False, index=True)
 
 
 class WeeklyScore(Base):
@@ -38,5 +57,5 @@ class WeeklyScore(Base):
     professionalism = Column(Float)
     activity = Column(Float)
     productivity_score = Column(Float)
-    organization_id = Column(String, nullable=False,
-                             index=True)  # Links to User's org
+    organization_id = Column(String, ForeignKey(
+        'organizations.id'), nullable=False, index=True)
