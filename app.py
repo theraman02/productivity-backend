@@ -1,3 +1,4 @@
+from database import engine
 from fastapi import FastAPI, Depends, HTTPException, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -22,6 +23,9 @@ import hashlib
 import uuid
 
 app = FastAPI(title="Employee Productivity Tracker")
+
+# Create database tables on startup
+Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
