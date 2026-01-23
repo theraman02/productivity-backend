@@ -165,8 +165,27 @@ def login(
         OrganizationMembership.organization_id == user.primary_organization_id
     ).first()
 
-    role = membership.role if membership else "admin"
-    token = create_session(user.id, user.primary_organization_id, role)
+    # FIX: Handle case where membership doesn't exist
+    if not membership:
+        # Check if user has any memberships at all
+        any_membership = db.query(OrganizationMembership).filter(
+            OrganizationMembership.user_id == user.id
+        ).first()
+
+        if any_membership:
+            # Use the first available membership
+            membership = any_membership
+            # Update user's primary organization
+            user.primary_organization_id = any_membership.organization_id
+            db.commit()
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="User has no organization memberships. Please contact support."
+            )
+
+    role = membership.role
+    token = create_session(user.id, membership.organization_id, role)
 
     return {
         "message": "Login successful",
@@ -176,7 +195,7 @@ def login(
             "username": user.username,
             "email": user.email,
             "role": role,
-            "organization_id": user.primary_organization_id
+            "organization_id": membership.organization_id
         }
     }
 
